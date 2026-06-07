@@ -6,19 +6,19 @@ require('dotenv').config();
 
 const app = express();
 
-// Trust Railway's proxy
 app.set('trust proxy', 1);
 
-// Security
 app.use(helmet());
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production'
-    ? 'https://mind-frontend.vercel.app'
-    : 'http://localhost:3000',
+  origin: [
+    'https://www.discovermind.net',
+    'https://discovermind.net',
+    'https://mind-frontend.vercel.app',
+    'http://localhost:3000',
+  ],
   credentials: true,
 }));
 
-// Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
