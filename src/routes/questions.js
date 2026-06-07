@@ -3,12 +3,12 @@ const router = express.Router();
 const db = require('../db');
 const authenticate = require('../middleware/authenticate');
 
-// GET /api/questions
+// GET /api/questions — returns questions in random order
 router.get('/', authenticate, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT question_id, question_text, leader_weight, manager_weight, ic_weight
-       FROM questions ORDER BY question_id`
+       FROM questions ORDER BY RANDOM()`
     );
     res.json(result.rows);
   } catch (err) {
