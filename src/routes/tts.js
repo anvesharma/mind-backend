@@ -3,11 +3,12 @@ const router = express.Router();
 const { GoogleAuth } = require('google-auth-library');
 const axios = require('axios');
 
+const credentials = JSON.parse(
+  Buffer.from(process.env.GOOGLE_CREDENTIALS_B64, 'base64').toString('utf8')
+);
+
 const auth = new GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-  },
+  credentials,
   scopes: ['https://www.googleapis.com/auth/cloud-platform'],
 });
 
@@ -23,19 +24,10 @@ router.post('/', async (req, res) => {
       'https://texttospeech.googleapis.com/v1/text:synthesize',
       {
         input: { text },
-        voice: {
-          languageCode: 'en-US',
-          name: 'en-US-Journey-F',
-        },
-        audioConfig: {
-          audioEncoding: 'MP3',
-          speakingRate: 0.95,
-          pitch: 0,
-        },
+        voice: { languageCode: 'en-US', name: 'en-US-Journey-F' },
+        audioConfig: { audioEncoding: 'MP3', speakingRate: 0.95, pitch: 0 },
       },
-      {
-        headers: { Authorization: `Bearer ${token.token}` },
-      }
+      { headers: { Authorization: `Bearer ${token.token}` } }
     );
 
     res.json({ audioContent: response.data.audioContent });
