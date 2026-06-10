@@ -28,7 +28,7 @@ router.get('/:rateeId', authenticate, async (req, res) => {
       if (!attributeMap[name]) {
         attributeMap[name] = {
           name,
-          value: r.response_value,
+          value: parseFloat(r.response_value),
           total_weight: (parseFloat(r.leader_weight)||0) + (parseFloat(r.manager_weight)||0) + (parseFloat(r.ic_weight)||0),
         };
       }
@@ -41,11 +41,12 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const top5 = sorted.slice(0, 5).map(a => ({ name: a.name, value: a.value }));
     const bottom5 = sorted.slice(-5).reverse().map(a => ({ name: a.name, value: a.value }));
 
+    // Fix: use AVG per question to avoid inflated scores from multiple raters
     const scoresRes = await db.query(`
       SELECT
-        ROUND(CAST(7 + (SUM(ur.response_value * q.leader_weight) * 10 / 100) * 3 AS numeric), 2) AS leader_score,
-        ROUND(CAST(7 + (SUM(ur.response_value * q.manager_weight) * 10 / 100) * 3 AS numeric), 2) AS manager_score,
-        ROUND(CAST(7 + (SUM(ur.response_value * q.ic_weight) * 10 / 100) * 3 AS numeric), 2) AS ic_score
+        ROUND(CAST(7 + (SUM(ur.response_value * q.leader_weight) / COUNT(DISTINCT ur.add_user_id) * 10 / 100) * 3 AS numeric), 2) AS leader_score,
+        ROUND(CAST(7 + (SUM(ur.response_value * q.manager_weight) / COUNT(DISTINCT ur.add_user_id) * 10 / 100) * 3 AS numeric), 2) AS manager_score,
+        ROUND(CAST(7 + (SUM(ur.response_value * q.ic_weight) / COUNT(DISTINCT ur.add_user_id) * 10 / 100) * 3 AS numeric), 2) AS ic_score
       FROM user_responses ur
       JOIN questions q ON ur.question_id = q.question_id
       WHERE ur.user_id = $1 AND ur.add_user_id = $2
@@ -67,7 +68,7 @@ router.get('/:rateeId', authenticate, async (req, res) => {
           ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (ls+ms+ics)/3) * 100 AS numeric), 0) AS total_pct
         FROM all_scores
       )
-      SELECT total_pct FROM ranked WHERE user_id = $1
+      SELECT total_pct FROM ranked WHERE user_id = $1 LIMIT 1
     `, [rateeId]);
 
     const percentiles = percentileRes.rows[0] || { total_pct: 0 };
