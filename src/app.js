@@ -39,6 +39,7 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/responses', require('./routes/responses'));
 app.use('/api/responses/personal-results', require('./routes/personalresults'));
 app.use('/api/social', require('./routes/social'));
+app.use('/api/social', require('./routes/social'));
 app.use('/api/tts', require('./routes/tts'));
 app.use('/api/nova-chat', require('./routes/novachat'));
 
