@@ -16,7 +16,7 @@ router.get('/:rateeId', authenticate, async (req, res) => {
         q.leader_weight, q.manager_weight, q.ic_weight
       FROM user_responses ur
       JOIN questions q ON ur.question_id = q.question_id
-      WHERE ur.ratee_id = $1 AND ur.add_user_id = $2
+      WHERE ur.user_id = $1 AND ur.add_user_id = $2
     `, [rateeId, assessorId]);
 
     const responses = responsesRes.rows;
@@ -48,26 +48,26 @@ router.get('/:rateeId', authenticate, async (req, res) => {
         ROUND(CAST(7 + (SUM(ur.response_value * q.ic_weight) * 10 / 100) * 3 AS numeric), 2) AS ic_score
       FROM user_responses ur
       JOIN questions q ON ur.question_id = q.question_id
-      WHERE ur.ratee_id = $1 AND ur.add_user_id = $2
+      WHERE ur.user_id = $1 AND ur.add_user_id = $2
     `, [rateeId, assessorId]);
 
     const scores = scoresRes.rows[0];
 
     const percentileRes = await db.query(`
       WITH all_scores AS (
-        SELECT ur.ratee_id,
+        SELECT ur.user_id,
           7 + (SUM(ur.response_value * q.leader_weight) * 10 / 100) * 3 AS ls,
           7 + (SUM(ur.response_value * q.manager_weight) * 10 / 100) * 3 AS ms,
           7 + (SUM(ur.response_value * q.ic_weight) * 10 / 100) * 3 AS ics
         FROM user_responses ur JOIN questions q ON ur.question_id = q.question_id
-        GROUP BY ur.ratee_id, ur.add_user_id
+        GROUP BY ur.user_id, ur.add_user_id
       ),
       ranked AS (
-        SELECT ratee_id,
+        SELECT user_id,
           ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (ls+ms+ics)/3) * 100 AS numeric), 0) AS total_pct
         FROM all_scores
       )
-      SELECT total_pct FROM ranked WHERE ratee_id = $1
+      SELECT total_pct FROM ranked WHERE user_id = $1
     `, [rateeId]);
 
     const percentiles = percentileRes.rows[0] || { total_pct: 0 };
