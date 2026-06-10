@@ -172,7 +172,7 @@ router.post('/rate/:token/submit', async (req, res) => {
                 At least 3 people have rated you on Mind. Your real Leader, Manager, and Contributor scores are ready — along with your top talents and growth areas.
               </p>
               <div style="text-align:center;margin-bottom:28px;">
-                <a href="${process.env.FRONTEND_URL}/personal-results/${t.ratee_id}" style="background:#ef9f27;color:#ffffff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
+                <a href="${process.env.FRONTEND_URL}/peer-results/${t.ratee_id}" style="background:#ef9f27;color:#ffffff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
                   See my results →
                 </a>
               </div>
