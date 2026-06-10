@@ -60,7 +60,7 @@ router.post('/payment-success', authenticate, async (req, res) => {
     if (!socialRes.rows.length) return res.status(404).json({ error: 'Session not found' });
     const social = socialRes.rows[0];
     if (social.status === 'paid') return res.json({ success: true, alreadyProcessed: true });
-    const emails = JSON.parse(social.emails);
+    const emails = typeof social.emails === 'string' ? JSON.parse(social.emails) : social.emails;
     const rateeId = social.ratee_id;
     const rateeRes = await db.query('SELECT user_name FROM users WHERE user_id = $1', [rateeId]);
     const rateeName = rateeRes.rows[0]?.user_name || 'someone';
