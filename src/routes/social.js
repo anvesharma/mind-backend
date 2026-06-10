@@ -8,9 +8,10 @@ const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 router.post('/create-checkout', authenticate, async (req, res) => {
-  const { emails, rateeId } = req.body;
+  const { emails, rateeId, userName } = req.body;
   const userId = req.user.user_id;
-  if (!emails || emails.length < 3 || emails.length > 5) {
+  const emailList = Array.isArray(emails) ? emails : [];
+  if (emailList.length < 3 || emailList.length > 5) {
     return res.status(400).json({ error: 'Please enter 3-5 email addresses' });
   }
   try {
@@ -18,7 +19,7 @@ router.post('/create-checkout', authenticate, async (req, res) => {
       INSERT INTO social_sessions (user_id, ratee_id, emails, status, expires_at)
       VALUES ($1, $2, $3, 'pending', NOW() + INTERVAL '7 days')
       RETURNING id
-    `, [userId, rateeId, JSON.stringify(emails)]);
+    `, [userId, rateeId, JSON.stringify(emailList)]);
     const socialSessionId = sessionRes.rows[0].id;
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -60,31 +61,52 @@ router.post('/payment-success', authenticate, async (req, res) => {
     if (!socialRes.rows.length) return res.status(404).json({ error: 'Session not found' });
     const social = socialRes.rows[0];
     if (social.status === 'paid') return res.json({ success: true, alreadyProcessed: true });
-    const emails = typeof social.emails === 'string' ? JSON.parse(social.emails) : social.emails;
+    const emailList = typeof social.emails === 'string' ? JSON.parse(social.emails) : social.emails;
     const rateeId = social.ratee_id;
     const rateeRes = await db.query('SELECT user_name FROM users WHERE user_id = $1', [rateeId]);
     const rateeName = rateeRes.rows[0]?.user_name || 'someone';
     const userRes = await db.query('SELECT user_name FROM users WHERE user_id = $1', [userId]);
     const userName = userRes.rows[0]?.user_name || 'A friend';
     const tokens = [];
-    for (const email of emails) {
+    for (const entry of emailList) {
+      const email = typeof entry === 'string' ? entry : entry.email;
+      const friendName = typeof entry === 'object' && entry.name ? entry.name : email.split('@')[0];
       const token = crypto.randomBytes(32).toString('hex');
       await db.query(`
         INSERT INTO social_tokens (social_session_id, email, token, ratee_id, completed)
         VALUES ($1, $2, $3, $4, false)
       `, [socialId, email, token, rateeId]);
-      tokens.push({ email, token });
+      tokens.push({ email, token, friendName });
     }
-    for (const { email, token } of tokens) {
+    for (const { email, token, friendName } of tokens) {
       await resend.emails.send({
-        from: 'Mind <noreply@discovermind.net>',
+        from: `${userName} via Mind <noreply@discovermind.net>`,
         to: email,
-        subject: `${userName} wants to know what you really think of them`,
-        html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#060d1a;color:#f0f4f8;padding:40px 32px;border-radius:16px;"><div style="text-align:center;margin-bottom:32px;"><span style="color:#ef9f27;font-size:20px;font-weight:700;">✦ Mind for You</span></div><h1 style="font-size:24px;font-weight:700;margin-bottom:12px;color:#ffffff;">${userName} wants your honest opinion</h1><p style="color:#7a9ab5;font-size:15px;line-height:1.6;margin-bottom:24px;">They've invited you to rate <strong style="color:#f0f4f8;">${rateeName}</strong> on Mind — a quick peer assessment that reveals their real leadership style and strengths.</p><p style="color:#7a9ab5;font-size:14px;margin-bottom:32px;">It takes about 5 minutes. Your rating is anonymous.</p><div style="text-align:center;margin-bottom:32px;"><a href="${process.env.FRONTEND_URL}/rate/${token}" style="background:#ef9f27;color:#050810;padding:14px 32px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">Rate ${rateeName} now →</a></div><p style="color:#3a5a70;font-size:12px;text-align:center;">This link is unique to you. Results are only visible to ${userName}.</p></div>`
+        subject: `${userName} is asking for your help`,
+        html: `
+          <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px 24px;background:#ffffff;color:#111111;border-radius:12px;">
+            <p style="font-size:16px;margin-bottom:16px;">Hi ${friendName},</p>
+            <p style="font-size:15px;line-height:1.7;margin-bottom:16px;">
+              <strong>${userName}</strong> trusts you as someone who knows them well. They want your honest opinion on their behavior, skills, and personality.
+            </p>
+            <p style="font-size:15px;line-height:1.7;margin-bottom:24px;">
+              Take 5 minutes to rate <strong>${rateeName}</strong> on Mind — a peer assessment platform — and help them uncover their real strengths and areas to grow.
+            </p>
+            <div style="text-align:center;margin-bottom:28px;">
+              <a href="${process.env.FRONTEND_URL}/rate/${token}" style="background:#ef9f27;color:#ffffff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
+                Rate ${rateeName} on Mind →
+              </a>
+            </div>
+            <p style="font-size:12px;color:#888888;line-height:1.6;">
+              Your rating is completely anonymous. ${userName} will only see an overall profile — not individual scores.<br/>
+              This link is unique to you and expires in 7 days.
+            </p>
+          </div>
+        `
       });
     }
     await db.query("UPDATE social_sessions SET status = 'paid' WHERE id = $1", [socialId]);
-    res.json({ success: true, emailsSent: emails.length });
+    res.json({ success: true, emailsSent: emailList.length });
   } catch (err) {
     console.error('Payment success error:', err.message);
     res.status(500).json({ error: 'Failed to process payment' });
@@ -140,10 +162,22 @@ router.post('/rate/:token/submit', async (req, res) => {
       const user = userRes.rows[0];
       if (user?.email) {
         await resend.emails.send({
-          from: 'Mind <noreply@discovermind.net>',
+          from: 'Mind for You <noreply@discovermind.net>',
           to: user.email,
           subject: 'Your Mind results are ready!',
-          html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#060d1a;color:#f0f4f8;padding:40px 32px;border-radius:16px;"><div style="text-align:center;margin-bottom:32px;"><span style="color:#ef9f27;font-size:20px;font-weight:700;">✦ Mind for You</span></div><h1 style="font-size:24px;font-weight:700;color:#ef9f27;">Your real results are in, ${user.user_name}!</h1><p style="color:#7a9ab5;font-size:15px;line-height:1.6;margin:16px 0 32px;">At least 3 people have rated you. Your real scores and top talents are ready.</p><div style="text-align:center;"><a href="${process.env.FRONTEND_URL}/personal-results/${t.ratee_id}" style="background:#ef9f27;color:#050810;padding:14px 32px;border-radius:12px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">See my results →</a></div></div>`
+          html: `
+            <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px 24px;background:#ffffff;color:#111111;border-radius:12px;">
+              <p style="font-size:16px;margin-bottom:16px;">Hi ${user.user_name},</p>
+              <p style="font-size:15px;line-height:1.7;margin-bottom:24px;">
+                At least 3 people have rated you on Mind. Your real Leader, Manager, and Contributor scores are ready — along with your top talents and growth areas.
+              </p>
+              <div style="text-align:center;margin-bottom:28px;">
+                <a href="${process.env.FRONTEND_URL}/personal-results/${t.ratee_id}" style="background:#ef9f27;color:#ffffff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;">
+                  See my results →
+                </a>
+              </div>
+            </div>
+          `
         });
       }
     }
