@@ -81,8 +81,8 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
         CAST(SUM(ur.response_value * q.ic_weight)      * 10 AS numeric) AS ic_raw
        FROM user_responses ur
        JOIN questions q ON ur.question_id = q.question_id
-       WHERE ur.user_id = $1`,
-      [ratee_id]
+       WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
+      [ratee_id, req.user.user_id]
     );
 
     const raw = scoresResult.rows[0];
@@ -115,14 +115,14 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
         ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (leader_raw + manager_raw + ic_raw)) * 100 AS numeric), 0) AS total_percentile
       FROM user_scores
       WHERE user_id = $1`,
-      [ratee_id]
+      [ratee_id, req.user.user_id]
     );
 
     const percentiles = percentileResult.rows[0];
 
     const rateeResult = await db.query(
       `SELECT user_name FROM users WHERE user_id = $1`,
-      [ratee_id]
+      [ratee_id, req.user.user_id]
     );
 
     res.json({
