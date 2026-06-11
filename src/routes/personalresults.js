@@ -21,7 +21,6 @@ router.get('/peer/:rateeId', async (req, res) => {
     const responses = responsesRes.rows;
     if (!responses.length) return res.status(404).json({ error: 'No responses found' });
 
-    // Group by rater, compute score per rater, then average across raters
     const raterMap = {};
     responses.forEach(r => {
       const rid = r.add_user_id;
@@ -29,11 +28,11 @@ router.get('/peer/:rateeId', async (req, res) => {
       raterMap[rid].push(r);
     });
 
-    const raterScores = Object.values(raterMap).map(raterResponses => {
-      const ls = raterResponses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)||0), 0);
-      const ms = raterResponses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.manager_weight)||0), 0);
-      const ics = raterResponses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.ic_weight)||0), 0);
-      return { ls: 7 + ls * 3, ms: 7 + ms * 3, ics: 7 + ics * 3 };
+    const raterScores = Object.values(raterMap).map(rr => {
+      const ls = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)||0), 0);
+      const ms = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.manager_weight)||0), 0);
+      const ics = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.ic_weight)||0), 0);
+      return { ls: 7 + (ls / 100) * 3, ms: 7 + (ms / 100) * 3, ics: 7 + (ics / 100) * 3 };
     });
 
     const n = raterScores.length;
@@ -43,7 +42,6 @@ router.get('/peer/:rateeId', async (req, res) => {
       ic_score: parseFloat((raterScores.reduce((s, r) => s + r.ics, 0) / n).toFixed(2)),
     };
 
-    // Attributes: average response per question across all raters
     const attrMap = {};
     responses.forEach(r => {
       if (!attrMap[r.question_text]) attrMap[r.question_text] = { name: r.question_text, values: [], lw: parseFloat(r.leader_weight)||0, mw: parseFloat(r.manager_weight)||0, iw: parseFloat(r.ic_weight)||0 };
@@ -91,14 +89,14 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const ics = responses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.ic_weight)||0), 0);
 
     const scores = {
-      leader_score: parseFloat((7 + ls * 3).toFixed(2)),
-      manager_score: parseFloat((7 + ms * 3).toFixed(2)),
-      ic_score: parseFloat((7 + ics * 3).toFixed(2)),
+      leader_score: parseFloat((7 + (ls / 100) * 3).toFixed(2)),
+      manager_score: parseFloat((7 + (ms / 100) * 3).toFixed(2)),
+      ic_score: parseFloat((7 + (ics / 100) * 3).toFixed(2)),
     };
 
     const attrMap = {};
     responses.forEach(r => {
-      if (!attrMap[r.question_text]) attrMap[r.question_text] = { name: r.question_text, value: parseFloat(r.response_value), lw: parseFloat(r.leader_weight)||0, mw: parseFloat(r.manager_weight)||0, iw: parseFloat(r.ic_weight)||0, total_weight: (parseFloat(r.leader_weight)||0)+(parseFloat(r.manager_weight)||0)+(parseFloat(r.ic_weight)||0) };
+      if (!attrMap[r.question_text]) attrMap[r.question_text] = { name: r.question_text, value: parseFloat(r.response_value), total_weight: (parseFloat(r.leader_weight)||0)+(parseFloat(r.manager_weight)||0)+(parseFloat(r.ic_weight)||0) };
     });
 
     const sorted = Object.values(attrMap).sort((a, b) =>
@@ -110,9 +108,9 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const percentileRes = await db.query(`
       WITH all_scores AS (
         SELECT ur.user_id, ur.add_user_id,
-          7 + (SUM(ur.response_value * q.leader_weight)) * 3 AS ls,
-          7 + (SUM(ur.response_value * q.manager_weight)) * 3 AS ms,
-          7 + (SUM(ur.response_value * q.ic_weight)) * 3 AS ics
+          7 + (SUM(ur.response_value * q.leader_weight) / 100) * 3 AS ls,
+          7 + (SUM(ur.response_value * q.manager_weight) / 100) * 3 AS ms,
+          7 + (SUM(ur.response_value * q.ic_weight) / 100) * 3 AS ics
         FROM user_responses ur JOIN questions q ON ur.question_id = q.question_id
         GROUP BY ur.user_id, ur.add_user_id
       ),
