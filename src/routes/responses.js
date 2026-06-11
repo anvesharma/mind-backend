@@ -73,7 +73,7 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
   const { ratee_id } = req.params;
 
   try {
-    // Raw scores 0-100
+    // Raw scores — filter by assessor so multiple raters don't inflate scores
     const scoresResult = await db.query(
       `SELECT
         CAST(SUM(ur.response_value * q.leader_weight)  * 10 AS numeric) AS leader_raw,
@@ -96,7 +96,7 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
       ic_score:      normalize(raw.ic_raw),
     };
 
-    // Percentiles based on normalized scores
+    // Percentiles
     const percentileResult = await db.query(
       `WITH user_scores AS (
         SELECT
@@ -115,14 +115,14 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
         ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (leader_raw + manager_raw + ic_raw)) * 100 AS numeric), 0) AS total_percentile
       FROM user_scores
       WHERE user_id = $1`,
-      [ratee_id, req.user.user_id]
+      [ratee_id]
     );
 
     const percentiles = percentileResult.rows[0];
 
     const rateeResult = await db.query(
       `SELECT user_name FROM users WHERE user_id = $1`,
-      [ratee_id, req.user.user_id]
+      [ratee_id]
     );
 
     res.json({
