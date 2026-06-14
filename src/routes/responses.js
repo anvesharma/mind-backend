@@ -73,12 +73,11 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
   const { ratee_id } = req.params;
 
   try {
-    // Raw scores — filter by assessor so multiple raters don't inflate scores
     const scoresResult = await db.query(
       `SELECT
-        CAST(SUM(ur.response_value * q.leader_weight)  * 10 AS numeric) AS leader_raw,
-        CAST(SUM(ur.response_value * q.manager_weight) * 10 AS numeric) AS manager_raw,
-        CAST(SUM(ur.response_value * q.ic_weight)      * 10 AS numeric) AS ic_raw
+        CAST(SUM(ur.response_value * q.leader_weight  / 100) * 10 AS numeric) AS leader_raw,
+        CAST(SUM(ur.response_value * q.manager_weight / 100) * 10 AS numeric) AS manager_raw,
+        CAST(SUM(ur.response_value * q.ic_weight      / 100) * 10 AS numeric) AS ic_raw
        FROM user_responses ur
        JOIN questions q ON ur.question_id = q.question_id
        WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
@@ -87,7 +86,6 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
 
     const raw = scoresResult.rows[0];
 
-    // Normalize to 7-10 scale: normalized = 7 + (raw/100) * 3
     const normalize = (v) => parseFloat((7 + (parseFloat(v) / 100) * 3).toFixed(2));
 
     const scores = {
@@ -96,14 +94,13 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
       ic_score:      normalize(raw.ic_raw),
     };
 
-    // Percentiles
     const percentileResult = await db.query(
       `WITH user_scores AS (
         SELECT
           ur.user_id,
-          CAST(SUM(ur.response_value * q.leader_weight)  * 10 AS numeric) AS leader_raw,
-          CAST(SUM(ur.response_value * q.manager_weight) * 10 AS numeric) AS manager_raw,
-          CAST(SUM(ur.response_value * q.ic_weight)      * 10 AS numeric) AS ic_raw
+          CAST(SUM(ur.response_value * q.leader_weight  / 100) * 10 AS numeric) AS leader_raw,
+          CAST(SUM(ur.response_value * q.manager_weight / 100) * 10 AS numeric) AS manager_raw,
+          CAST(SUM(ur.response_value * q.ic_weight      / 100) * 10 AS numeric) AS ic_raw
         FROM user_responses ur
         JOIN questions q ON ur.question_id = q.question_id
         GROUP BY ur.user_id
