@@ -72,6 +72,7 @@ router.get('/progress/:ratee_id', authenticate, async (req, res) => {
 // Shared handler used by both /results/:ratee_id and /personal-results/:rateeId
 async function getResults(rateeId, assessorId, res) {
   try {
+    // ─── Weighted average per dimension (Ethical Behaviour excluded) ──────────
     const scoresResult = await db.query(
       `SELECT
         SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
@@ -85,6 +86,7 @@ async function getResults(rateeId, assessorId, res) {
       [rateeId, assessorId]
     );
 
+    // ─── Ethical Behaviour rating (penalty only) ──────────────────────────────
     const ethicsResult = await db.query(
       `SELECT ur.response_value AS ethics_score
        FROM user_responses ur
@@ -98,6 +100,7 @@ async function getResults(rateeId, assessorId, res) {
 
     const raw = scoresResult.rows[0];
 
+    // ─── Normalize to 5–10 scale ──────────────────────────────────────────────
     const normalize = (v) => {
       if (v === null || v === undefined) return null;
       return parseFloat((5 + ((parseFloat(v) - 1) / 9) * 5).toFixed(2));
@@ -109,13 +112,21 @@ async function getResults(rateeId, assessorId, res) {
       ic_score:      normalize(raw.ic_avg),
     };
 
+    // ─── Ethical Behaviour penalty ────────────────────────────────────────────
+    // Y = (10 - X) / 10, where X is the peer Ethical Behaviour rating (1–10)
+    // Leader:  subtract 1.5 × Y
+    // Manager: subtract 1.0 × Y
+    // IC:      subtract 0.8 × Y
+    // Floor of 5.00 applies across all three — penalty cannot push below 5
     if (ethicsResult.rows.length > 0) {
       const X = parseFloat(ethicsResult.rows[0].ethics_score);
       const Y = (10 - X) / 10;
       if (scores.leader_score  !== null) scores.leader_score  = parseFloat(Math.max(5, scores.leader_score  - 1.5 * Y).toFixed(2));
       if (scores.manager_score !== null) scores.manager_score = parseFloat(Math.max(5, scores.manager_score - 1.0 * Y).toFixed(2));
+      if (scores.ic_score      !== null) scores.ic_score      = parseFloat(Math.max(5, scores.ic_score      - 0.8 * Y).toFixed(2));
     }
 
+    // ─── Percentiles ──────────────────────────────────────────────────────────
     const percentileResult = await db.query(
       `WITH user_scores AS (
         SELECT
@@ -144,11 +155,13 @@ async function getResults(rateeId, assessorId, res) {
       total_percentile: 0, total_pct: 0,
     };
 
+    // ─── Ratee name ───────────────────────────────────────────────────────────
     const rateeResult = await db.query(
       `SELECT user_name FROM users WHERE user_id = $1`,
       [rateeId]
     );
 
+    // ─── Per-attribute breakdown for top5 / bottom5 ───────────────────────────
     const responsesRes = await db.query(
       `SELECT
         ur.response_value,
