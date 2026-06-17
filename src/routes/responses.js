@@ -73,43 +73,91 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
   const { ratee_id } = req.params;
 
   try {
+    // ─── Step 1: Weighted average per dimension ───────────────────────────────
+    // Excludes Ethical Behaviour (weight = 0) from the weighted average.
+    // Formula: SUM(response_value × weight) / SUM(weight) → 1–10 weighted avg
+    // Normalization: 5 + ((avg - 1) / 9) * 5 → 5.00–10.00
+    //   • A peer rating of 1 on every attribute → 5.00
+    //   • A peer rating of 10 on every attribute → 10.00
     const scoresResult = await db.query(
       `SELECT
-        CAST(SUM(ur.response_value * q.leader_weight  / 100) * 10 AS numeric) AS leader_raw,
-        CAST(SUM(ur.response_value * q.manager_weight / 100) * 10 AS numeric) AS manager_raw,
-        CAST(SUM(ur.response_value * q.ic_weight      / 100) * 10 AS numeric) AS ic_raw
+        SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
+        SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS manager_avg,
+        SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS ic_avg
        FROM user_responses ur
        JOIN questions q ON ur.question_id = q.question_id
-       WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
+       WHERE ur.user_id = $1
+         AND ur.add_user_id = $2
+         AND q.question_text != 'Ethical Behaviour'`,
+      [ratee_id, req.user.user_id]
+    );
+
+    // ─── Step 2: Fetch Ethical Behaviour rating ───────────────────────────────
+    // Used only for the penalty — not included in the weighted average above.
+    const ethicsResult = await db.query(
+      `SELECT ur.response_value AS ethics_score
+       FROM user_responses ur
+       JOIN questions q ON ur.question_id = q.question_id
+       WHERE ur.user_id = $1
+         AND ur.add_user_id = $2
+         AND q.question_text = 'Ethical Behaviour'
+       LIMIT 1`,
       [ratee_id, req.user.user_id]
     );
 
     const raw = scoresResult.rows[0];
 
-    const normalize = (v) => parseFloat((7 + (parseFloat(v) / 100) * 3).toFixed(2));
-
-    const scores = {
-      leader_score:  normalize(raw.leader_raw),
-      manager_score: normalize(raw.manager_raw),
-      ic_score:      normalize(raw.ic_raw),
+    // ─── Step 3: Normalize to 5–10 scale ─────────────────────────────────────
+    const normalize = (v) => {
+      if (v === null || v === undefined) return null;
+      return parseFloat((5 + ((parseFloat(v) - 1) / 9) * 5).toFixed(2));
     };
 
+    const scores = {
+      leader_score:  normalize(raw.leader_avg),
+      manager_score: normalize(raw.manager_avg),
+      ic_score:      normalize(raw.ic_avg),
+    };
+
+    // ─── Step 4: Apply Ethical Behaviour penalty ──────────────────────────────
+    // Y = (10 - X) / 10, where X is the Ethical Behaviour peer rating (1–10)
+    // Leader  penalty: subtract 1.5 × Y from leader_score
+    // Manager penalty: subtract 1.0 × Y from manager_score
+    // A perfect ethics score (X=10) → Y=0 → no penalty
+    // A zero ethics score  (X=1)  → Y=0.9 → max penalty of 1.35 (L) / 0.90 (M)
+    if (ethicsResult.rows.length > 0) {
+      const X = parseFloat(ethicsResult.rows[0].ethics_score);
+      const Y = (10 - X) / 10;
+
+      if (scores.leader_score  !== null) {
+        scores.leader_score  = parseFloat(Math.max(5, scores.leader_score  - 1.5 * Y).toFixed(2));
+      }
+      if (scores.manager_score !== null) {
+        scores.manager_score = parseFloat(Math.max(5, scores.manager_score - 1.0 * Y).toFixed(2));
+      }
+    }
+
+    // ─── Step 5: Percentiles ──────────────────────────────────────────────────
+    // Uses the same weighted average (Ethical Behaviour excluded from weights).
+    // Penalty is NOT applied to percentile base — percentile reflects raw talent
+    // signal; the penalty is a display-layer adjustment on the final score.
     const percentileResult = await db.query(
       `WITH user_scores AS (
         SELECT
           ur.user_id,
-          CAST(SUM(ur.response_value * q.leader_weight  / 100) * 10 AS numeric) AS leader_raw,
-          CAST(SUM(ur.response_value * q.manager_weight / 100) * 10 AS numeric) AS manager_raw,
-          CAST(SUM(ur.response_value * q.ic_weight      / 100) * 10 AS numeric) AS ic_raw
+          SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
+          SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS manager_avg,
+          SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS ic_avg
         FROM user_responses ur
         JOIN questions q ON ur.question_id = q.question_id
+        WHERE q.question_text != 'Ethical Behaviour'
         GROUP BY ur.user_id
       )
       SELECT
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY leader_raw)  * 100 AS numeric), 0) AS leader_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY manager_raw) * 100 AS numeric), 0) AS manager_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY ic_raw)      * 100 AS numeric), 0) AS ic_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (leader_raw + manager_raw + ic_raw)) * 100 AS numeric), 0) AS total_percentile
+        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY leader_avg)  * 100 AS numeric), 0) AS leader_percentile,
+        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY manager_avg) * 100 AS numeric), 0) AS manager_percentile,
+        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY ic_avg)      * 100 AS numeric), 0) AS ic_percentile,
+        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (leader_avg + manager_avg + ic_avg)) * 100 AS numeric), 0) AS total_percentile
       FROM user_scores
       WHERE user_id = $1`,
       [ratee_id]
