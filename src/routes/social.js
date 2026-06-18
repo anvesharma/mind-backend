@@ -30,7 +30,7 @@ router.post('/create-checkout', authenticate, async (req, res) => {
             name: 'Mind for You — Real Peer Rating',
             description: 'Get rated by up to 5 people who know you best.',
           },
-          unit_amount: 199,
+          unit_amount: 366,
         },
         quantity: 1,
       }],
