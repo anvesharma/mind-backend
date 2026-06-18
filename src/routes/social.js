@@ -30,7 +30,7 @@ router.post('/create-checkout', authenticate, async (req, res) => {
             name: 'Mind for You — Real Peer Rating',
             description: 'Get rated by up to 5 people who know you best.',
           },
-          unit_amount: 366,
+          unit_amount: 199,
         },
         quantity: 1,
       }],
@@ -98,7 +98,7 @@ router.post('/payment-success', authenticate, async (req, res) => {
               </a>
             </div>
             <p style="font-size:12px;color:#888888;line-height:1.6;">
-              Your rating is completely anonymous. ${userName} will only see an overall profile — not individual scores.<br/>
+              Your rating is 100% anonymous. ${rateeName} can only see their final Leadership, Management and Independent Contributor scores — calculated from 33 attributes rated by 3 or more people. There is no way to trace the final score back to any individual rating.
               This link is unique to you and expires in 7 days.
             </p>
           </div>
