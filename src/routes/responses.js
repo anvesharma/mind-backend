@@ -14,7 +14,9 @@ router.post('/', authenticate, async (req, res) => {
   try {
     await db.query(
       `INSERT INTO user_responses (user_id, question_id, response_value, add_user_id)
-       VALUES ($1, $2, $3, $4)`,
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, question_id, add_user_id)
+       DO UPDATE SET response_value = $3`,
       [ratee_id, question_id, response_value, assessor_id]
     );
 
