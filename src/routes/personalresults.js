@@ -166,31 +166,19 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const top5    = sorted.slice(0, 5).map(a => ({ name: a.name, value: a.value }));
     const bottom5 = sorted.slice(-5).reverse().map(a => ({ name: a.name, value: a.value }));
 
-    // Percentile — average per assessor first, then average across assessors per user
+    // Percentile — rank against ALL users globally using simple avg response value
+    // This is question-set agnostic so all 34+ users appear in the pool
     const percentileRes = await db.query(`
-      WITH per_assessor AS (
-        SELECT
-          ur.user_id,
-          ur.add_user_id,
-          SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS l_avg,
-          SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS m_avg,
-          SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS i_avg
-        FROM user_responses ur
-        JOIN questions q ON ur.question_id = q.question_id
-        GROUP BY ur.user_id, ur.add_user_id
-      ),
-      user_scores AS (
+      WITH user_scores AS (
         SELECT
           user_id,
-          AVG(l_avg) AS l_avg,
-          AVG(m_avg) AS m_avg,
-          AVG(i_avg) AS i_avg
-        FROM per_assessor
+          AVG(response_value) AS avg_score
+        FROM user_responses
         GROUP BY user_id
       ),
       ranked AS (
         SELECT user_id,
-          ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (l_avg + m_avg + i_avg) / 3) * 100 AS numeric), 0) AS total_pct
+          ROUND(CAST(PERCENT_RANK() OVER (ORDER BY avg_score) * 100 AS numeric), 0) AS total_pct
         FROM user_scores
       )
       SELECT total_pct FROM ranked WHERE user_id = $1 LIMIT 1
