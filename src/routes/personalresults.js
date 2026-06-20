@@ -3,16 +3,19 @@ const router = express.Router();
 const db = require('../db');
 const authenticate = require('../middleware/authenticate');
 
-// Helper: weighted average → normalize to 7–10
-// SUM(value * weight) / SUM(weight) gives a 1–10 weighted avg
-// then: 7 + ((avg - 1) / 9) * 3 maps 1→7.00, 10→10.00
+// Normalize 1–10 weighted avg to 7–10 scale
 function normalize(weightedSum, totalWeight) {
   if (!totalWeight) return 7.00;
   const avg = weightedSum / totalWeight;
-  return parseFloat((7 + ((avg - 1) / 9) * 3).toFixed(2));
+  return 7 + ((avg - 1) / 9) * 3;
 }
 
-// ── Peer route (no auth — used for public share links) ──────────────────
+// Ethical Behaviour penalty: (10 - x) / 10, applied to Leader and Manager only
+function ethicalPenalty(rating) {
+  return (10 - parseFloat(rating)) / 10;
+}
+
+// ── Peer route (no auth) ────────────────────────────────────────────────
 router.get('/peer/:rateeId', async (req, res) => {
   const { rateeId } = req.params;
   try {
@@ -34,7 +37,7 @@ router.get('/peer/:rateeId', async (req, res) => {
     const responses = responsesRes.rows;
     if (!responses.length) return res.status(404).json({ error: 'No responses found' });
 
-    // Group by rater, compute weighted avg per rater, then average across raters
+    // Group by rater
     const raterMap = {};
     responses.forEach(r => {
       const rid = r.add_user_id;
@@ -43,15 +46,20 @@ router.get('/peer/:rateeId', async (req, res) => {
     });
 
     const raterScores = Object.values(raterMap).map(rr => {
-      const lSum  = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)  || 0), 0);
-      const mSum  = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.manager_weight) || 0), 0);
-      const iSum  = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.ic_weight)      || 0), 0);
-      const lW    = rr.reduce((s, r) => s + (parseFloat(r.leader_weight)  || 0), 0);
-      const mW    = rr.reduce((s, r) => s + (parseFloat(r.manager_weight) || 0), 0);
-      const iW    = rr.reduce((s, r) => s + (parseFloat(r.ic_weight)      || 0), 0);
+      const lSum = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)  || 0), 0);
+      const mSum = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.manager_weight) || 0), 0);
+      const iSum = rr.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.ic_weight)      || 0), 0);
+      const lW   = rr.reduce((s, r) => s + (parseFloat(r.leader_weight)  || 0), 0);
+      const mW   = rr.reduce((s, r) => s + (parseFloat(r.manager_weight) || 0), 0);
+      const iW   = rr.reduce((s, r) => s + (parseFloat(r.ic_weight)      || 0), 0);
+
+      // Get this rater's Ethical Behaviour rating
+      const ethRow = rr.find(r => r.question_text === 'Ethical Behaviour');
+      const penalty = ethRow ? ethicalPenalty(ethRow.response_value) : 0;
+
       return {
-        ls:  normalize(lSum, lW),
-        ms:  normalize(mSum, mW),
+        ls:  normalize(lSum, lW) - penalty,
+        ms:  normalize(mSum, mW) - penalty,
         ics: normalize(iSum, iW),
       };
     });
@@ -63,7 +71,7 @@ router.get('/peer/:rateeId', async (req, res) => {
       ic_score:      parseFloat((raterScores.reduce((s, r) => s + r.ics, 0) / n).toFixed(2)),
     };
 
-    // Top/bottom attributes: average response value across all raters per question
+    // Top/bottom attributes by avg response value across raters
     const attrMap = {};
     responses.forEach(r => {
       if (!attrMap[r.question_text]) {
@@ -82,9 +90,11 @@ router.get('/peer/:rateeId', async (req, res) => {
       a.total_weight = a.lw + a.mw + a.iw;
     });
 
-    const sorted = Object.values(attrMap).sort((a, b) =>
-      b.value !== a.value ? b.value - a.value : b.total_weight - a.total_weight
-    );
+    // Exclude Ethical Behaviour from top/bottom lists
+    const sorted = Object.values(attrMap)
+      .filter(a => a.name !== 'Ethical Behaviour')
+      .sort((a, b) => b.value !== a.value ? b.value - a.value : b.total_weight - a.total_weight);
+
     const top5    = sorted.slice(0, 5).map(a => ({ name: a.name, value: parseFloat(a.value.toFixed(2)) }));
     const bottom5 = sorted.slice(-5).reverse().map(a => ({ name: a.name, value: parseFloat(a.value.toFixed(2)) }));
 
@@ -118,6 +128,10 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const responses = responsesRes.rows;
     if (!responses.length) return res.status(404).json({ error: 'No responses found' });
 
+    // Get Ethical Behaviour rating
+    const ethRow = responses.find(r => r.question_text === 'Ethical Behaviour');
+    const penalty = ethRow ? ethicalPenalty(ethRow.response_value) : 0;
+
     // Weighted average per dimension
     const lSum = responses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)  || 0), 0);
     const mSum = responses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.manager_weight) || 0), 0);
@@ -127,22 +141,24 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const iW   = responses.reduce((s, r) => s + (parseFloat(r.ic_weight)      || 0), 0);
 
     const scores = {
-      leader_score:  normalize(lSum, lW),
-      manager_score: normalize(mSum, mW),
-      ic_score:      normalize(iSum, iW),
+      leader_score:  parseFloat((normalize(lSum, lW) - penalty).toFixed(2)),
+      manager_score: parseFloat((normalize(mSum, mW) - penalty).toFixed(2)),
+      ic_score:      parseFloat(normalize(iSum, iW).toFixed(2)),
     };
 
-    // Top/bottom attributes by raw response value
+    // Top/bottom attributes — exclude Ethical Behaviour
     const attrMap = {};
-    responses.forEach(r => {
-      if (!attrMap[r.question_text]) {
-        attrMap[r.question_text] = {
-          name: r.question_text,
-          value: parseFloat(r.response_value),
-          total_weight: (parseFloat(r.leader_weight) || 0) + (parseFloat(r.manager_weight) || 0) + (parseFloat(r.ic_weight) || 0),
-        };
-      }
-    });
+    responses
+      .filter(r => r.question_text !== 'Ethical Behaviour')
+      .forEach(r => {
+        if (!attrMap[r.question_text]) {
+          attrMap[r.question_text] = {
+            name: r.question_text,
+            value: parseFloat(r.response_value),
+            total_weight: (parseFloat(r.leader_weight) || 0) + (parseFloat(r.manager_weight) || 0) + (parseFloat(r.ic_weight) || 0),
+          };
+        }
+      });
 
     const sorted = Object.values(attrMap).sort((a, b) =>
       b.value !== a.value ? b.value - a.value : b.total_weight - a.total_weight
@@ -150,22 +166,32 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const top5    = sorted.slice(0, 5).map(a => ({ name: a.name, value: a.value }));
     const bottom5 = sorted.slice(-5).reverse().map(a => ({ name: a.name, value: a.value }));
 
-    // Percentile using correct weighted average formula
+    // Percentile — average per assessor first, then average across assessors per user
     const percentileRes = await db.query(`
-      WITH all_scores AS (
+      WITH per_assessor AS (
         SELECT
           ur.user_id,
+          ur.add_user_id,
           SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS l_avg,
           SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS m_avg,
           SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS i_avg
         FROM user_responses ur
         JOIN questions q ON ur.question_id = q.question_id
-        GROUP BY ur.user_id
+        GROUP BY ur.user_id, ur.add_user_id
+      ),
+      user_scores AS (
+        SELECT
+          user_id,
+          AVG(l_avg) AS l_avg,
+          AVG(m_avg) AS m_avg,
+          AVG(i_avg) AS i_avg
+        FROM per_assessor
+        GROUP BY user_id
       ),
       ranked AS (
         SELECT user_id,
           ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (l_avg + m_avg + i_avg) / 3) * 100 AS numeric), 0) AS total_pct
-        FROM all_scores
+        FROM user_scores
       )
       SELECT total_pct FROM ranked WHERE user_id = $1 LIMIT 1
     `, [rateeId]);
