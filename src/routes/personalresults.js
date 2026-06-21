@@ -10,9 +10,11 @@ function normalize(weightedSum, totalWeight) {
   return 7 + ((avg - 1) / 9) * 3;
 }
 
-// Ethical Behaviour penalty: (10 - x) / 10, applied to Leader and Manager only
-function ethicalPenalty(rating) {
-  return (10 - parseFloat(rating)) / 10;
+// Ethical Behaviour penalty: Y = (10 - x) / 10
+// Leader penalty = 1.5Y, Manager penalty = 1.0Y, IC penalty = 0.75Y
+function ethicalPenalties(rating) {
+  const Y = (10 - parseFloat(rating)) / 10;
+  return { leaderPenalty: 1.5 * Y, managerPenalty: 1.0 * Y, icPenalty: 0.75 * Y };
 }
 
 // ── Peer route (no auth) ────────────────────────────────────────────────
@@ -55,12 +57,12 @@ router.get('/peer/:rateeId', async (req, res) => {
 
       // Get this rater's Ethical Behaviour rating
       const ethRow = rr.find(r => r.question_text === 'Ethical Behaviour');
-      const penalty = ethRow ? ethicalPenalty(ethRow.response_value) : 0;
+      const { leaderPenalty, managerPenalty, icPenalty } = ethRow ? ethicalPenalties(ethRow.response_value) : { leaderPenalty: 0, managerPenalty: 0, icPenalty: 0 };
 
       return {
-        ls:  normalize(lSum, lW) - penalty,
-        ms:  normalize(mSum, mW) - penalty,
-        ics: normalize(iSum, iW),
+        ls:  normalize(lSum, lW) - leaderPenalty,
+        ms:  normalize(mSum, mW) - managerPenalty,
+        ics: normalize(iSum, iW) - icPenalty,
       };
     });
 
@@ -130,7 +132,7 @@ router.get('/:rateeId', authenticate, async (req, res) => {
 
     // Get Ethical Behaviour rating
     const ethRow = responses.find(r => r.question_text === 'Ethical Behaviour');
-    const penalty = ethRow ? ethicalPenalty(ethRow.response_value) : 0;
+    const { leaderPenalty, managerPenalty, icPenalty } = ethRow ? ethicalPenalties(ethRow.response_value) : { leaderPenalty: 0, managerPenalty: 0, icPenalty: 0 };
 
     // Weighted average per dimension
     const lSum = responses.reduce((s, r) => s + parseFloat(r.response_value) * (parseFloat(r.leader_weight)  || 0), 0);
@@ -141,9 +143,9 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const iW   = responses.reduce((s, r) => s + (parseFloat(r.ic_weight)      || 0), 0);
 
     const scores = {
-      leader_score:  parseFloat((normalize(lSum, lW) - penalty).toFixed(2)),
-      manager_score: parseFloat((normalize(mSum, mW) - penalty).toFixed(2)),
-      ic_score:      parseFloat(normalize(iSum, iW).toFixed(2)),
+      leader_score:  parseFloat((normalize(lSum, lW) - leaderPenalty).toFixed(2)),
+      manager_score: parseFloat((normalize(mSum, mW) - managerPenalty).toFixed(2)),
+      ic_score:      parseFloat((normalize(iSum, iW) - icPenalty).toFixed(2)),
     };
 
     // Top/bottom attributes — exclude Ethical Behaviour
@@ -166,19 +168,31 @@ router.get('/:rateeId', authenticate, async (req, res) => {
     const top5    = sorted.slice(0, 5).map(a => ({ name: a.name, value: a.value }));
     const bottom5 = sorted.slice(-5).reverse().map(a => ({ name: a.name, value: a.value }));
 
-    // Percentile — rank against ALL users globally using simple avg response value
-    // This is question-set agnostic so all 34+ users appear in the pool
+    // Percentile — average per assessor first, then average across assessors per user
     const percentileRes = await db.query(`
-      WITH user_scores AS (
+      WITH per_assessor AS (
+        SELECT
+          ur.user_id,
+          ur.add_user_id,
+          SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS l_avg,
+          SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS m_avg,
+          SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS i_avg
+        FROM user_responses ur
+        JOIN questions q ON ur.question_id = q.question_id
+        GROUP BY ur.user_id, ur.add_user_id
+      ),
+      user_scores AS (
         SELECT
           user_id,
-          AVG(response_value) AS avg_score
-        FROM user_responses
+          AVG(l_avg) AS l_avg,
+          AVG(m_avg) AS m_avg,
+          AVG(i_avg) AS i_avg
+        FROM per_assessor
         GROUP BY user_id
       ),
       ranked AS (
         SELECT user_id,
-          ROUND(CAST(PERCENT_RANK() OVER (ORDER BY avg_score) * 100 AS numeric), 0) AS total_pct
+          ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (l_avg + m_avg + i_avg) / 3) * 100 AS numeric), 0) AS total_pct
         FROM user_scores
       )
       SELECT total_pct FROM ranked WHERE user_id = $1 LIMIT 1

@@ -75,12 +75,29 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
   const { ratee_id } = req.params;
 
   try {
-    // Raw scores — filter by assessor so multiple raters don't inflate scores
+    // Step 1: Get Ethical Behaviour rating
+    const ethicalRes = await db.query(
+      `SELECT ur.response_value
+       FROM user_responses ur
+       JOIN questions q ON ur.question_id = q.question_id
+       WHERE ur.user_id = $1 AND ur.add_user_id = $2
+         AND q.question_text = 'Ethical Behaviour'`,
+      [ratee_id, req.user.user_id]
+    );
+    const ethicalRating = ethicalRes.rows.length ? parseFloat(ethicalRes.rows[0].response_value) : 10;
+    const Y = (10 - ethicalRating) / 10;
+    const leaderPenalty  = 1.5 * Y;
+    const managerPenalty = 1.0 * Y;
+    const icPenalty      = 0.75 * Y;
+
+    // Step 2: Weighted average per dimension
+    // SUM(value * weight) / SUM(weight) → 1–10 weighted avg
+    // Normalize to 7–10: 7 + ((avg - 1) / 9) * 3
     const scoresResult = await db.query(
       `SELECT
-        CAST(SUM(ur.response_value * q.leader_weight)  * 10 AS numeric) AS leader_raw,
-        CAST(SUM(ur.response_value * q.manager_weight) * 10 AS numeric) AS manager_raw,
-        CAST(SUM(ur.response_value * q.ic_weight)      * 10 AS numeric) AS ic_raw
+        SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
+        SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS manager_avg,
+        SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS ic_avg
        FROM user_responses ur
        JOIN questions q ON ur.question_id = q.question_id
        WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
@@ -89,16 +106,19 @@ router.get('/results/:ratee_id', authenticate, async (req, res) => {
 
     const raw = scoresResult.rows[0];
 
-    // Normalize to 7-10 scale: normalized = 7 + (raw/100) * 3
-    const normalize = (v) => parseFloat((7 + (parseFloat(v) / 100) * 3).toFixed(2));
-
-    const scores = {
-      leader_score:  normalize(raw.leader_raw),
-      manager_score: normalize(raw.manager_raw),
-      ic_score:      normalize(raw.ic_raw),
+    const normalize = (v) => {
+      if (v === null || v === undefined) return null;
+      return 7 + ((parseFloat(v) - 1) / 9) * 3;
     };
 
-    // Percentiles — average per assessor first, then average across assessors per user
+    // Step 3: Apply Ethical Behaviour penalty — 1.5Y for Leader, Y for Manager
+    const scores = {
+      leader_score:  parseFloat((normalize(raw.leader_avg)  - leaderPenalty).toFixed(2)),
+      manager_score: parseFloat((normalize(raw.manager_avg) - managerPenalty).toFixed(2)),
+      ic_score:      parseFloat((normalize(raw.ic_avg)      - icPenalty).toFixed(2)),
+    };
+
+    // Step 4: Percentiles — average per assessor first, then rank globally
     const percentileResult = await db.query(
       `WITH per_assessor AS (
         SELECT
