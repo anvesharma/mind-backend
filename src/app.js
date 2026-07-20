@@ -37,11 +37,11 @@ app.use('/api/auth', otpLimiter, require('./routes/auth'));
 app.use('/api/questions', require('./routes/questions'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/responses', require('./routes/responses'));
-app.use('/api/responses/personal-results', require('./routes/personalresults'));
 app.use('/api/social', require('./routes/social'));
 app.use('/api/social', require('./routes/social'));
 app.use('/api/tts', require('./routes/tts'));
 app.use('/api/nova-chat', require('./routes/novachat'));
+app.use('/api/influencer-applications', require('./routes/influencer'));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
