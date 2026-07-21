@@ -89,7 +89,7 @@ function computeScoresFromRows(rows) {
   const norm = (sumVW, sumW) => {
     if (!sumW) return null;
     const avg = sumVW / sumW;
-    return 7 + ((avg - 1) / 9) * 3;
+    return 4 + ((avg - 1) / 9) * 6;
   };
 
   const Y = (10 - ethical) / 10;
