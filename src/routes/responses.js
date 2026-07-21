@@ -71,86 +71,112 @@ router.get('/progress/:ratee_id', authenticate, async (req, res) => {
   }
 });
 
+function computeScoresFromRows(rows) {
+  let lw = 0, mw = 0, iw = 0;
+  let lv = 0, mv = 0, iv = 0;
+  let ethical = 10;
+
+  rows.forEach(r => {
+    const v  = parseFloat(r.response_value);
+    const Lw = parseFloat(r.leader_weight)  || 0;
+    const Mw = parseFloat(r.manager_weight) || 0;
+    const Iw = parseFloat(r.ic_weight)      || 0;
+    lw += Lw; mw += Mw; iw += Iw;
+    lv += v * Lw; mv += v * Mw; iv += v * Iw;
+    if (r.question_text === 'Ethical Behaviour') ethical = v;
+  });
+
+  const norm = (sumVW, sumW) => {
+    if (!sumW) return null;
+    const avg = sumVW / sumW;
+    return 7 + ((avg - 1) / 9) * 3;
+  };
+
+  const Y = (10 - ethical) / 10;
+  const leaderPenalty  = 1.5 * Y;
+  const managerPenalty = 1.0 * Y;
+  const icPenalty      = 0.75 * Y;
+
+  let leader  = norm(lv, lw);
+  let manager = norm(mv, mw);
+  let ic      = norm(iv, iw);
+
+  if (leader  !== null) leader  = leader  - leaderPenalty;
+  if (manager !== null) manager = manager - managerPenalty;
+  if (ic      !== null) ic      = ic      - icPenalty;
+
+  return { leader, manager, ic };
+}
+
 router.get('/results/:ratee_id', authenticate, async (req, res) => {
   const { ratee_id } = req.params;
 
   try {
-    // Step 1: Get Ethical Behaviour rating
-    const ethicalRes = await db.query(
-      `SELECT ur.response_value
-       FROM user_responses ur
-       JOIN questions q ON ur.question_id = q.question_id
-       WHERE ur.user_id = $1 AND ur.add_user_id = $2
-         AND q.question_text = 'Ethical Behaviour'`,
-      [ratee_id, req.user.user_id]
-    );
-    const ethicalRating = ethicalRes.rows.length ? parseFloat(ethicalRes.rows[0].response_value) : 10;
-    const Y = (10 - ethicalRating) / 10;
-    const leaderPenalty  = 1.5 * Y;
-    const managerPenalty = 1.0 * Y;
-    const icPenalty      = 0.75 * Y;
-
-    // Step 2: Weighted average per dimension
-    // SUM(value * weight) / SUM(weight) → 1–10 weighted avg
-    // Normalize to 7–10: 7 + ((avg - 1) / 9) * 3
-    const scoresResult = await db.query(
-      `SELECT
-        SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
-        SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS manager_avg,
-        SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS ic_avg
+    const myRows = await db.query(
+      `SELECT ur.response_value, ur.add_user_id, q.question_text,
+              q.leader_weight, q.manager_weight, q.ic_weight
        FROM user_responses ur
        JOIN questions q ON ur.question_id = q.question_id
        WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
       [ratee_id, req.user.user_id]
     );
 
-    const raw = scoresResult.rows[0];
+    if (!myRows.rows.length) {
+      return res.status(404).json({ error: 'No responses found' });
+    }
 
-    const normalize = (v) => {
-      if (v === null || v === undefined) return null;
-      return 7 + ((parseFloat(v) - 1) / 9) * 3;
-    };
-
-    // Step 3: Apply Ethical Behaviour penalty — 1.5Y for Leader, Y for Manager
+    const myScores = computeScoresFromRows(myRows.rows);
     const scores = {
-      leader_score:  parseFloat((normalize(raw.leader_avg)  - leaderPenalty).toFixed(2)),
-      manager_score: parseFloat((normalize(raw.manager_avg) - managerPenalty).toFixed(2)),
-      ic_score:      parseFloat((normalize(raw.ic_avg)      - icPenalty).toFixed(2)),
+      leader_score:  myScores.leader  !== null ? parseFloat(myScores.leader.toFixed(2))  : null,
+      manager_score: myScores.manager !== null ? parseFloat(myScores.manager.toFixed(2)) : null,
+      ic_score:      myScores.ic      !== null ? parseFloat(myScores.ic.toFixed(2))      : null,
     };
 
-    // Step 4: Percentiles — average per assessor first, then rank globally
-    const percentileResult = await db.query(
-      `WITH per_assessor AS (
-        SELECT
-          ur.user_id,
-          ur.add_user_id,
-          SUM(ur.response_value * q.leader_weight)  / NULLIF(SUM(q.leader_weight),  0) AS leader_avg,
-          SUM(ur.response_value * q.manager_weight) / NULLIF(SUM(q.manager_weight), 0) AS manager_avg,
-          SUM(ur.response_value * q.ic_weight)      / NULLIF(SUM(q.ic_weight),      0) AS ic_avg
-        FROM user_responses ur
-        JOIN questions q ON ur.question_id = q.question_id
-        GROUP BY ur.user_id, ur.add_user_id
-      ),
-      user_scores AS (
-        SELECT
-          user_id,
-          AVG(leader_avg)  AS leader_avg,
-          AVG(manager_avg) AS manager_avg,
-          AVG(ic_avg)      AS ic_avg
-        FROM per_assessor
-        GROUP BY user_id
-      )
-      SELECT
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY leader_avg)  * 100 AS numeric), 0) AS leader_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY manager_avg) * 100 AS numeric), 0) AS manager_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY ic_avg)      * 100 AS numeric), 0) AS ic_percentile,
-        ROUND(CAST(PERCENT_RANK() OVER (ORDER BY (leader_avg + manager_avg + ic_avg) / 3) * 100 AS numeric), 0) AS total_percentile
-      FROM user_scores
-      WHERE user_id = $1`,
-      [ratee_id]
+    const allRows = await db.query(
+      `SELECT ur.user_id, ur.add_user_id, ur.response_value, q.question_text,
+              q.leader_weight, q.manager_weight, q.ic_weight
+       FROM user_responses ur
+       JOIN questions q ON ur.question_id = q.question_id`
     );
 
-    const percentiles = percentileResult.rows[0];
+    const byPerson = {};
+    allRows.rows.forEach(r => {
+      const p = r.user_id, a = r.add_user_id;
+      byPerson[p] = byPerson[p] || {};
+      byPerson[p][a] = byPerson[p][a] || [];
+      byPerson[p][a].push(r);
+    });
+
+    const personScores = {};
+    Object.keys(byPerson).forEach(p => {
+      const assessors = Object.values(byPerson[p]);
+      const perAssessor = assessors.map(rows => computeScoresFromRows(rows));
+      const avg = (key) => {
+        const vals = perAssessor.map(s => s[key]).filter(v => v !== null);
+        if (!vals.length) return null;
+        return vals.reduce((a, b) => a + b, 0) / vals.length;
+      };
+      const leader = avg('leader'), manager = avg('manager'), ic = avg('ic');
+      const parts = [leader, manager, ic].filter(v => v !== null);
+      const overall = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null;
+      personScores[p] = { leader, manager, ic, overall };
+    });
+
+    const pctRank = (targetVal, key) => {
+      if (targetVal === null || targetVal === undefined) return 0;
+      const all = Object.values(personScores).map(s => s[key]).filter(v => v !== null);
+      if (all.length <= 1) return 100;
+      const below = all.filter(v => v < targetVal).length;
+      return Math.round((below / (all.length - 1)) * 100);
+    };
+
+    const me = personScores[ratee_id] || { leader: null, manager: null, ic: null, overall: null };
+    const percentiles = {
+      leader_percentile:  pctRank(me.leader,  'leader'),
+      manager_percentile: pctRank(me.manager, 'manager'),
+      ic_percentile:      pctRank(me.ic,      'ic'),
+      total_percentile:   pctRank(me.overall, 'overall'),
+    };
 
     const rateeResult = await db.query(
       `SELECT user_name FROM users WHERE user_id = $1`,
