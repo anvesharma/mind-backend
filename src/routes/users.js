@@ -52,13 +52,27 @@ router.post('/ratee', authenticate, async (req, res) => {
 
 router.post('/trial-signup', authenticate, async (req, res) => {
   const userId = req.user.user_id;
+  const { email: providedEmail, name: providedName } = req.body || {};
   try {
     const userRes = await db.query(
-      'SELECT user_name, email FROM users WHERE user_id = $1',
+      'SELECT user_name, email, real_email FROM users WHERE user_id = $1',
       [userId]
     );
     if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = userRes.rows[0];
+
+    // Guest with no real email must provide one now
+    if (!user.real_email) {
+      if (!providedEmail) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+      await db.query(
+        'UPDATE users SET email = $1, real_email = TRUE, user_name = COALESCE($2, user_name) WHERE user_id = $3',
+        [providedEmail, providedName || null, userId]
+      );
+      user.email = providedEmail;
+      if (providedName) user.user_name = providedName;
+    }
 
     await db.query(
       'UPDATE users SET trial_signup = TRUE, trial_signup_at = NOW() WHERE user_id = $1',

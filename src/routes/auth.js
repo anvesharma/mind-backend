@@ -90,16 +90,16 @@ router.post('/verify-otp', async (req, res) => {
     if (userResult.rows.length === 0) {
       const guestId = `guest_${Date.now()}`;
       const insertResult = await db.query(
-        `INSERT INTO users (user_name, email, guest_id)
-         VALUES ($1, $2, $3) RETURNING *`,
+        `INSERT INTO users (user_name, email, guest_id, real_email)
+         VALUES ($1, $2, $3, TRUE) RETURNING *`,
         [name, email, guestId]
       );
       user = insertResult.rows[0];
     } else {
       user = userResult.rows[0];
-      // Update name if changed
+      // Update name if changed, ensure real_email flag set
       await db.query(
-        `UPDATE users SET user_name = $1 WHERE user_id = $2`,
+        `UPDATE users SET user_name = $1, real_email = TRUE WHERE user_id = $2`,
         [name, user.user_id]
       );
       user.user_name = name;
@@ -139,6 +139,40 @@ router.post('/logout', async (req, res) => {
     await db.query(`DELETE FROM sessions WHERE session_token = $1`, [token]);
   }
   res.json({ message: 'Logged out' });
+});
+
+
+// POST /api/auth/guest — anonymous entry (QR code, no email)
+router.post('/guest', async (req, res) => {
+  try {
+    const guestId = `guest_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const insertResult = await db.query(
+      `INSERT INTO users (user_name, guest_id, real_email)
+       VALUES ($1, $2, FALSE) RETURNING *`,
+      ['Guest', guestId]
+    );
+    const user = insertResult.rows[0];
+
+    const token = jwt.sign(
+      { user_id: user.user_id, email: null },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    await db.query(
+      `INSERT INTO sessions (session_token, user_id, expires_at) VALUES ($1, $2, $3)`,
+      [token, user.user_id, expiresAt]
+    );
+
+    res.json({
+      token,
+      user: { user_id: user.user_id, user_name: user.user_name, email: null },
+    });
+  } catch (err) {
+    console.error('Guest entry error:', err);
+    res.status(500).json({ error: 'Failed to create guest session' });
+  }
 });
 
 module.exports = router;
