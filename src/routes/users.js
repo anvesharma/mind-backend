@@ -62,21 +62,33 @@ router.post('/trial-signup', authenticate, async (req, res) => {
     const user = userRes.rows[0];
 
     // Guest with no real email must provide one now
+    let targetUserId = userId;
     if (!user.real_email) {
       if (!providedEmail) {
         return res.status(400).json({ error: 'email_required' });
       }
-      await db.query(
-        'UPDATE users SET email = $1, real_email = TRUE, user_name = COALESCE($2, user_name) WHERE user_id = $3',
-        [providedEmail, providedName || null, userId]
+      // If this email already belongs to an existing account, mark THAT one instead
+      const existing = await db.query(
+        'SELECT user_id, user_name, email FROM users WHERE email = $1 LIMIT 1',
+        [providedEmail]
       );
-      user.email = providedEmail;
-      if (providedName) user.user_name = providedName;
+      if (existing.rows.length) {
+        targetUserId = existing.rows[0].user_id;
+        user.email = existing.rows[0].email;
+        user.user_name = existing.rows[0].user_name;
+      } else {
+        await db.query(
+          'UPDATE users SET email = $1, real_email = TRUE, user_name = COALESCE($2, user_name) WHERE user_id = $3',
+          [providedEmail, providedName || null, userId]
+        );
+        user.email = providedEmail;
+        if (providedName) user.user_name = providedName;
+      }
     }
 
     await db.query(
       'UPDATE users SET trial_signup = TRUE, trial_signup_at = NOW() WHERE user_id = $1',
-      [userId]
+      [targetUserId]
     );
 
     try {
