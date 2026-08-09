@@ -2,13 +2,131 @@ const express = require('express');
 const router = express.Router();
 const db = require('../db');
 const authenticate = require('../middleware/authenticate');
+const scoring = require('../scoring');
 
+// ── Shared queries ───────────────────────────────────────────────────────
+
+/** Size of the question bank. A submission must answer all of them to score. */
+async function getTotalQuestions() {
+  const result = await db.query('SELECT COUNT(*)::int AS total FROM questions');
+  return result.rows[0].total;
+}
+
+/**
+ * Every response belonging to an (assessor, ratee) pair that answered the full
+ * question bank. This is the ranking pool — all routes rank against it, so
+ * Mind for Work and Mind for You draw percentiles from the same population.
+ */
+async function getCompletedResponses() {
+  const result = await db.query(`
+    WITH complete_pairs AS (
+      SELECT user_id, add_user_id
+      FROM user_responses
+      GROUP BY user_id, add_user_id
+      HAVING COUNT(DISTINCT question_id) >= (SELECT COUNT(*) FROM questions)
+    )
+    SELECT ur.user_id, ur.add_user_id, ur.question_id, ur.response_value,
+           q.question_text, q.leader_weight, q.manager_weight, q.ic_weight
+    FROM user_responses ur
+    JOIN questions q ON ur.question_id = q.question_id
+    JOIN complete_pairs cp
+      ON cp.user_id = ur.user_id AND cp.add_user_id = ur.add_user_id
+  `);
+  return result.rows;
+}
+
+/** Responses about `rateeId`, optionally narrowed to a single assessor. */
+async function getResponsesFor(rateeId, assessorId = null) {
+  const params = assessorId ? [rateeId, assessorId] : [rateeId];
+  const filter = assessorId ? 'AND ur.add_user_id = $2' : '';
+
+  const result = await db.query(
+    `SELECT ur.user_id, ur.add_user_id, ur.question_id, ur.response_value,
+            q.question_text, q.leader_weight, q.manager_weight, q.ic_weight
+     FROM user_responses ur
+     JOIN questions q ON ur.question_id = q.question_id
+     WHERE ur.user_id = $1 ${filter}`,
+    params
+  );
+  return result.rows;
+}
+
+async function getRatee(rateeId) {
+  const result = await db.query(
+    'SELECT user_id, user_name FROM users WHERE user_id = $1',
+    [rateeId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * The one results handler. Every results route funnels through here so the
+ * scale, the ethics penalty and the percentile pool can never diverge again.
+ *
+ * @param {string|number} rateeId
+ * @param {string|number|null} assessorId  null = aggregate across all raters
+ */
+async function buildResults(rateeId, assessorId) {
+  const ratee = await getRatee(rateeId);
+  if (!ratee) return { error: 'User not found', status: 404 };
+
+  const rows = await getResponsesFor(rateeId, assessorId);
+  if (!rows.length) return { error: 'No responses found', status: 404 };
+
+  const totalQuestions = await getTotalQuestions();
+
+  // One submission per rater; only fully answered ones count toward the score.
+  const grouped = scoring.groupByRateeAndAssessor(rows);
+  const submissions = Object.values(grouped[rateeId] || {}).map(scoring.scoreSubmission);
+  const completed = submissions.filter((s) => scoring.isComplete(s, totalQuestions));
+
+  if (!completed.length) {
+    return {
+      error: 'Assessment incomplete',
+      status: 409,
+      detail: {
+        answered: Math.max(...submissions.map((s) => s.answered), 0),
+        required: totalQuestions,
+      },
+    };
+  }
+
+  const aggregate = scoring.aggregateSubmissions(completed);
+  const pool = scoring.buildPool(await getCompletedResponses(), totalQuestions);
+  const { top5, bottom5 } = scoring.attributeBreakdown(rows);
+
+  return {
+    body: {
+      ratee,
+      scores: scoring.formatScores(aggregate),
+      percentiles: scoring.formatPercentiles(aggregate, pool),
+      top5,
+      bottom5,
+      raters: aggregate.raters,
+    },
+  };
+}
+
+function send(res, result) {
+  if (result.error) {
+    return res.status(result.status).json({ error: result.error, ...result.detail });
+  }
+  return res.json(result.body);
+}
+
+// ── Saving responses ─────────────────────────────────────────────────────
+
+// POST /api/responses — save one answer and advance the resume point.
+// Partial submissions are stored so a rater can pick up where they left off;
+// they simply do not count toward a score until the bank is complete.
 router.post('/', authenticate, async (req, res) => {
   const { ratee_id, question_id, response_value } = req.body;
   const assessor_id = req.user.user_id;
 
   if (!ratee_id || !question_id || response_value === undefined) {
-    return res.status(400).json({ error: 'ratee_id, question_id and response_value are required' });
+    return res
+      .status(400)
+      .json({ error: 'ratee_id, question_id and response_value are required' });
   }
 
   try {
@@ -30,11 +148,12 @@ router.post('/', authenticate, async (req, res) => {
 
     res.json({ message: 'Response saved' });
   } catch (err) {
-    console.error(err);
+    console.error('Save response error:', err.message);
     res.status(500).json({ error: 'Failed to save response' });
   }
 });
 
+// POST /api/responses/complete
 router.post('/complete', authenticate, async (req, res) => {
   const { ratee_id } = req.body;
   const assessor_id = req.user.user_id;
@@ -47,150 +166,96 @@ router.post('/complete', authenticate, async (req, res) => {
     );
     res.json({ message: 'Assessment completed' });
   } catch (err) {
-    console.error(err);
+    console.error('Complete assessment error:', err.message);
     res.status(500).json({ error: 'Failed to complete assessment' });
   }
 });
 
+// GET /api/responses/progress/:ratee_id — resume state for this rater.
+//
+// The identity pair is (assessor_id from JWT, ratee_id).
+//
+// Returns the SET of question ids already answered, not a position. The
+// question bank is served in random order, so a positional resume point is
+// meaningless on the next visit: the same index lands on a different question.
+// The client resumes by removing answered ids from the freshly shuffled bank.
 router.get('/progress/:ratee_id', authenticate, async (req, res) => {
   const assessor_id = req.user.user_id;
   const { ratee_id } = req.params;
 
   try {
-    const result = await db.query(
-      `SELECT ap.*, q.question_text
-       FROM assessment_progress ap
-       LEFT JOIN questions q ON ap.last_question_id = q.question_id
-       WHERE ap.assessor_id = $1 AND ap.ratee_id = $2`,
-      [assessor_id, ratee_id]
-    );
-    res.json(result.rows[0] || null);
+    const [progressResult, answeredResult, totalResult] = await Promise.all([
+      db.query(
+        `SELECT ap.started_at, ap.updated_at, ap.completed AS marked_completed,
+                ap.last_question_id, q.question_text AS last_question_text
+         FROM assessment_progress ap
+         LEFT JOIN questions q ON ap.last_question_id = q.question_id
+         WHERE ap.assessor_id = $1 AND ap.ratee_id = $2`,
+        [assessor_id, ratee_id]
+      ),
+      db.query(
+        `SELECT DISTINCT question_id
+         FROM user_responses
+         WHERE add_user_id = $1 AND user_id = $2`,
+        [assessor_id, ratee_id]
+      ),
+      db.query('SELECT COUNT(*)::int AS total FROM questions'),
+    ]);
+
+    const answeredQuestionIds = answeredResult.rows.map((r) => r.question_id);
+    const total = totalResult.rows[0].total;
+    const answered = answeredQuestionIds.length;
+
+    res.json({
+      ...(progressResult.rows[0] || {}),
+      answered_question_ids: answeredQuestionIds,
+      answered,
+      total,
+      remaining: Math.max(total - answered, 0),
+      // Derived from actual responses rather than the assessment_progress flag,
+      // which only gets set if the rater reached the end in one sitting.
+      completed: total > 0 && answered >= total,
+      resuming: answered > 0 && answered < total,
+    });
   } catch (err) {
-    console.error(err);
+    console.error('Get progress error:', err.message);
     res.status(500).json({ error: 'Failed to get progress' });
   }
 });
 
-function computeScoresFromRows(rows) {
-  let lw = 0, mw = 0, iw = 0;
-  let lv = 0, mv = 0, iv = 0;
-  let ethical = 10;
+// ── Results ──────────────────────────────────────────────────────────────
 
-  rows.forEach(r => {
-    const v  = parseFloat(r.response_value);
-    const Lw = parseFloat(r.leader_weight)  || 0;
-    const Mw = parseFloat(r.manager_weight) || 0;
-    const Iw = parseFloat(r.ic_weight)      || 0;
-    lw += Lw; mw += Mw; iw += Iw;
-    lv += v * Lw; mv += v * Mw; iv += v * Iw;
-    if (r.question_text === 'Ethical Behaviour') ethical = v;
-  });
-
-  const norm = (sumVW, sumW) => {
-    if (!sumW) return null;
-    const avg = sumVW / sumW;
-    return 4 + ((avg - 1) / 9) * 6;
-  };
-
-  const Y = (10 - ethical) / 10;
-  const leaderPenalty  = 1.5 * Y;
-  const managerPenalty = 1.0 * Y;
-  const icPenalty      = 0.75 * Y;
-
-  let leader  = norm(lv, lw);
-  let manager = norm(mv, mw);
-  let ic      = norm(iv, iw);
-
-  if (leader  !== null) leader  = leader  - leaderPenalty;
-  if (manager !== null) manager = manager - managerPenalty;
-  if (ic      !== null) ic      = ic      - icPenalty;
-
-  return { leader, manager, ic };
-}
-
+// GET /api/responses/results/:ratee_id — Mind for Work.
+// What this rater alone reported about the ratee.
 router.get('/results/:ratee_id', authenticate, async (req, res) => {
-  const { ratee_id } = req.params;
-
   try {
-    const myRows = await db.query(
-      `SELECT ur.response_value, ur.add_user_id, q.question_text,
-              q.leader_weight, q.manager_weight, q.ic_weight
-       FROM user_responses ur
-       JOIN questions q ON ur.question_id = q.question_id
-       WHERE ur.user_id = $1 AND ur.add_user_id = $2`,
-      [ratee_id, req.user.user_id]
-    );
-
-    if (!myRows.rows.length) {
-      return res.status(404).json({ error: 'No responses found' });
-    }
-
-    const myScores = computeScoresFromRows(myRows.rows);
-    const scores = {
-      leader_score:  myScores.leader  !== null ? parseFloat(myScores.leader.toFixed(2))  : null,
-      manager_score: myScores.manager !== null ? parseFloat(myScores.manager.toFixed(2)) : null,
-      ic_score:      myScores.ic      !== null ? parseFloat(myScores.ic.toFixed(2))      : null,
-    };
-
-    const allRows = await db.query(
-      `SELECT ur.user_id, ur.add_user_id, ur.response_value, q.question_text,
-              q.leader_weight, q.manager_weight, q.ic_weight
-       FROM user_responses ur
-       JOIN questions q ON ur.question_id = q.question_id`
-    );
-
-    const byPerson = {};
-    allRows.rows.forEach(r => {
-      const p = r.user_id, a = r.add_user_id;
-      byPerson[p] = byPerson[p] || {};
-      byPerson[p][a] = byPerson[p][a] || [];
-      byPerson[p][a].push(r);
-    });
-
-    const personScores = {};
-    Object.keys(byPerson).forEach(p => {
-      const assessors = Object.values(byPerson[p]);
-      const perAssessor = assessors.map(rows => computeScoresFromRows(rows));
-      const avg = (key) => {
-        const vals = perAssessor.map(s => s[key]).filter(v => v !== null);
-        if (!vals.length) return null;
-        return vals.reduce((a, b) => a + b, 0) / vals.length;
-      };
-      const leader = avg('leader'), manager = avg('manager'), ic = avg('ic');
-      const parts = [leader, manager, ic].filter(v => v !== null);
-      const overall = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null;
-      personScores[p] = { leader, manager, ic, overall };
-    });
-
-    const pctRank = (targetVal, key) => {
-      if (targetVal === null || targetVal === undefined) return 0;
-      const all = Object.values(personScores).map(s => s[key]).filter(v => v !== null);
-      if (all.length <= 1) return 100;
-      const below = all.filter(v => v < targetVal).length;
-      return Math.round((below / (all.length - 1)) * 100);
-    };
-
-    const me = personScores[ratee_id] || { leader: null, manager: null, ic: null, overall: null };
-    const percentiles = {
-      leader_percentile:  pctRank(me.leader,  'leader'),
-      manager_percentile: pctRank(me.manager, 'manager'),
-      ic_percentile:      pctRank(me.ic,      'ic'),
-      total_percentile:   pctRank(me.overall, 'overall'),
-    };
-
-    const rateeResult = await db.query(
-      `SELECT user_name FROM users WHERE user_id = $1`,
-      [ratee_id]
-    );
-
-    res.json({
-      ratee: rateeResult.rows[0],
-      scores,
-      percentiles,
-    });
+    send(res, await buildResults(req.params.ratee_id, req.user.user_id));
   } catch (err) {
-    console.error(err);
+    console.error('Results error:', err.message);
     res.status(500).json({ error: 'Failed to get results' });
+  }
+});
+
+// GET /api/responses/personal-results/peer/:rateeId — aggregate across every
+// peer who completed the assessment. No auth: reached via an emailed link.
+// Declared before the /:rateeId route so "peer" is not read as an id.
+router.get('/personal-results/peer/:rateeId', async (req, res) => {
+  try {
+    send(res, await buildResults(req.params.rateeId, null));
+  } catch (err) {
+    console.error('Peer results error:', err.message);
+    res.status(500).json({ error: 'Failed to get results' });
+  }
+});
+
+// GET /api/responses/personal-results/:rateeId — Mind for You.
+// Same handler, same scale, same pool as Mind for Work.
+router.get('/personal-results/:rateeId', authenticate, async (req, res) => {
+  try {
+    send(res, await buildResults(req.params.rateeId, req.user.user_id));
+  } catch (err) {
+    console.error('Personal results error:', err.message);
+    res.status(500).json({ error: 'Failed to get personal results' });
   }
 });
 

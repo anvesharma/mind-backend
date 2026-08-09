@@ -38,7 +38,6 @@ app.use('/api/questions', require('./routes/questions'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/responses', require('./routes/responses'));
 app.use('/api/social', require('./routes/social'));
-app.use('/api/social', require('./routes/social'));
 app.use('/api/tts', require('./routes/tts'));
 app.use('/api/nova-chat', require('./routes/novachat'));
 app.use('/api/influencer-applications', require('./routes/influencer'));
