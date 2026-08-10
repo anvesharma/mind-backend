@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const limits = require('./ratelimit');
 require('dotenv').config();
 
 const app = express();
@@ -21,49 +22,55 @@ app.use(cors({
 
 // ── Rate limiting ────────────────────────────────────────────────────────────
 //
-// Budget the general limit against the real cost of the product's core action.
-// One complete assessment is ~38 requests:
+// Keyed on the caller's session rather than their IP. An office shares one
+// public IP, so IP-keyed limits mean one employee rating colleagues quickly
+// locks out the whole company. See src/ratelimit.js for the full reasoning
+// and the numbers.
 //
-//   1  POST /users/ratee
-//   1  GET  /questions
-//   1  GET  /responses/progress/:id
-//  33  POST /responses            (one per answer — this is the bulk of it)
-//   1  POST /responses/complete
-//   1  GET  /responses/results/:id
-//
-// The previous limit of 100 per 15 minutes allowed 2.6 assessments before
-// returning 429, which surfaced in the UI as "Failed to save response" partway
-// through the third review. 1000 allows ~26 assessments per window.
-//
-// This matters most for the Uber tablet: every passenger shares one IP, and
-// limits here are per-IP.
+// The original config was 100 requests / 15 min per IP. One assessment costs
+// ~38 requests, so that allowed 2.6 reviews before returning 429 — which the
+// UI reported as "Failed to save response" partway through a third review.
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
+  windowMs: limits.WINDOW_MS,
+  max: limits.GENERAL_MAX,
+  keyGenerator: limits.sessionKey,
   standardHeaders: true,   // RateLimit-* headers so the client can see the budget
   legacyHeaders: false,
-  message: {
-    error: 'Too many requests. Please wait a moment and try again.',
-  },
+  message: { error: 'Too many requests. Please wait a moment and try again.' },
   skip: (req) => req.path === '/health',
 });
 app.use(generalLimiter);
 
-// OTP stays deliberately strict — it sends email and is the abuse-prone path.
-const otpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 5,
+// express.json() must run before the OTP limiters — otpKey reads req.body.email.
+app.use(express.json());
+
+// Keyed on the target email: stops one inbox being spammed without blocking
+// the sixth colleague to sign up from the same office.
+const otpEmailLimiter = rateLimit({
+  windowMs: limits.OTP_WINDOW_MS,
+  max: limits.OTP_MAX_PER_EMAIL,
+  keyGenerator: limits.otpKey,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many OTP requests, please try again later' },
-  // Only throttle OTP sending. Verifying a code, logging out and entering as a
-  // guest were all sharing this 5-per-10-minute budget for no reason.
+  message: { error: 'Too many OTP requests for this email, please try again later' },
+  // Only throttle OTP sending. Verifying a code, logging out and guest entry
+  // were all sharing this 5-per-10-minute budget for no reason.
   skip: (req) => req.path !== '/send-otp',
 });
 
-app.use(express.json());
+// Backstop: catches a script rotating through addresses to dodge the email key,
+// while still leaving room for a whole office to onboard the same morning.
+const otpIpLimiter = rateLimit({
+  windowMs: limits.OTP_WINDOW_MS,
+  max: limits.OTP_MAX_PER_IP,
+  keyGenerator: limits.ipKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many OTP requests, please try again later' },
+  skip: (req) => req.path !== '/send-otp',
+});
 
-app.use('/api/auth', otpLimiter, require('./routes/auth'));
+app.use('/api/auth', otpIpLimiter, otpEmailLimiter, require('./routes/auth'));
 app.use('/api/questions', require('./routes/questions'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/responses', require('./routes/responses'));
