@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const authenticate = require('../middleware/authenticate');
 const scoring = require('../scoring');
+const poolCache = require('../poolcache');
 
 // ── Shared queries ───────────────────────────────────────────────────────
 
@@ -66,14 +67,33 @@ async function getRatee(rateeId) {
  * @param {string|number} rateeId
  * @param {string|number|null} assessorId  null = aggregate across all raters
  */
+/**
+ * The percentile pool, cached.
+ *
+ * Building it reads every completed response in the database, so doing it per
+ * request made the results page take seconds — a refresh recomputed the entire
+ * population to render one card. It only changes when a submission completes,
+ * which invalidates the cache.
+ */
+async function getPercentilePool(totalQuestions) {
+  const cached = poolCache.get(totalQuestions);
+  if (cached) return cached;
+
+  const pool = scoring.buildPool(await getCompletedResponses(), totalQuestions);
+  return poolCache.set(pool, totalQuestions);
+}
+
 async function buildResults(rateeId, assessorId) {
-  const ratee = await getRatee(rateeId);
+  // Independent queries — issue them together rather than paying three
+  // sequential round trips to the connection pooler before anything renders.
+  const [ratee, rows, totalQuestions] = await Promise.all([
+    getRatee(rateeId),
+    getResponsesFor(rateeId, assessorId),
+    getTotalQuestions(),
+  ]);
+
   if (!ratee) return { error: 'User not found', status: 404 };
-
-  const rows = await getResponsesFor(rateeId, assessorId);
   if (!rows.length) return { error: 'No responses found', status: 404 };
-
-  const totalQuestions = await getTotalQuestions();
 
   // One submission per rater; only fully answered ones count toward the score.
   const grouped = scoring.groupByRateeAndAssessor(rows);
@@ -92,7 +112,7 @@ async function buildResults(rateeId, assessorId) {
   }
 
   const aggregate = scoring.aggregateSubmissions(completed);
-  const pool = scoring.buildPool(await getCompletedResponses(), totalQuestions);
+  const pool = await getPercentilePool(totalQuestions);
   const { top5, bottom5 } = scoring.attributeBreakdown(rows);
 
   return {
@@ -164,6 +184,10 @@ router.post('/complete', authenticate, async (req, res) => {
        WHERE assessor_id = $1 AND ratee_id = $2`,
       [assessor_id, ratee_id]
     );
+
+    // A new completed submission changes the ranking population.
+    poolCache.invalidate();
+
     res.json({ message: 'Assessment completed' });
   } catch (err) {
     console.error('Complete assessment error:', err.message);
