@@ -5,8 +5,9 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "node test/scoring.test.js && node test/ratelimit.test.js && node test/poolcache.test.js",
-    "check": "node --check src/app.js && node --check src/scoring.js && node --check src/ratelimit.js && node --check src/poolcache.js && node --check src/routes/responses.js && npm test"
+    "test": "node test/scoring.test.js && node test/ratelimit.test.js && node test/poolcache.test.js && node test/reputation.test.js",
+    "check": "node --check src/app.js && node --check src/scoring.js && node --check src/ratelimit.js && node --check src/poolcache.js && node --check src/reputation.js && node --check src/reputationstore.js && node --check src/routes/responses.js && npm test",
+    "reputation:backfill": "node scripts/backfill-reputation.js"
   },
   "dependencies": {
     "axios": "^1.17.0",

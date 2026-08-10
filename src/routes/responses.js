@@ -4,6 +4,7 @@ const db = require('../db');
 const authenticate = require('../middleware/authenticate');
 const scoring = require('../scoring');
 const poolCache = require('../poolcache');
+const reputationStore = require('../reputationstore');
 
 // ── Shared queries ───────────────────────────────────────────────────────
 
@@ -188,7 +189,16 @@ router.post('/complete', authenticate, async (req, res) => {
     // A new completed submission changes the ranking population.
     poolCache.invalidate();
 
+    // Respond first. Reputation is an internal analytics figure — nothing in
+    // this response depends on it, and the rater should not wait on a full
+    // recomputation to see their results.
     res.json({ message: 'Assessment completed' });
+
+    // Recompute for every rater of this ratee, not just this one: a new rater
+    // shifts the leave-one-out consensus for all the others.
+    reputationStore.recomputeForRatee(ratee_id).catch((err) => {
+      console.error('Reputation recompute failed for ratee', ratee_id, err.message);
+    });
   } catch (err) {
     console.error('Complete assessment error:', err.message);
     res.status(500).json({ error: 'Failed to complete assessment' });
